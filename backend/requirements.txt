@@ -1,0 +1,14 @@
+flask
+flask-socketio
+flask-cors
+pylsl
+bleak
+numpy
+scipy
+pyserial
+websocket-client
+eventlet
+
+# Optional GUI dependencies
+pyqtgraph
+PyQt5
