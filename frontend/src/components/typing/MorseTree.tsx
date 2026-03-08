@@ -1,7 +1,10 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { PredictionPanel } from "@/components/typing/PredictionPanel";
+import { TelegramContactPicker } from "@/components/typing/TelegramContactPicker";
+import { TelegramAddContact } from "@/components/typing/TelegramAddContact";
 
 interface TreeNode {
     char: string;
@@ -100,8 +103,14 @@ interface MorseTreeProps {
 // Confirmation dialog types
 type ConfirmAction = "go_home" | "clear_text" | null;
 
-export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps) => {
+const API_BASE = "http://localhost:5000";
+
+export const MorseTree = ({ mode, onModeSwitch, typedText, onTypedTextChange }: MorseTreeProps) => {
     const navigate = useNavigate();
+    const [searchParams] = useSearchParams();
+    const replyToContactId = searchParams.get("replyTo");
+    const [replyContact, setReplyContact] = useState<any>(null);
+
     const [currentNode, setCurrentNode] = useState<TreeNode>(buildMorseTree());
     const [path, setPath] = useState<string[]>([]);
     const tree = buildMorseTree();
@@ -109,6 +118,74 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
     // Confirmation dialog state
     const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
     const [confirmSelection, setConfirmSelection] = useState<"yes" | "no">("no"); // Default to No (safe)
+
+    // Telegram state
+    const [telegramPickerOpen, setTelegramPickerOpen] = useState(false);
+    const [addContactOpen, setAddContactOpen] = useState(false);
+    const [sendStatus, setSendStatus] = useState<{ type: "success" | "error"; message: string } | null>(null);
+    const [isSending, setIsSending] = useState(false);
+
+    // Fetch reply contact if replyTo is set
+    useEffect(() => {
+        if (!replyToContactId) return;
+        fetch(`${API_BASE}/telegram/contacts`)
+            .then(res => res.json())
+            .then(data => {
+                const c = data.contacts?.find((c: any) => c.id === replyToContactId);
+                if (c) setReplyContact(c);
+            })
+            .catch(() => { });
+    }, [replyToContactId]);
+
+    // Handle Direct Reply action
+    const handleDirectReply = async () => {
+        if (!replyContact || isSending) return;
+        setIsSending(true);
+        setSendStatus({ type: "success", message: "Sending..." });
+        try {
+            const res = await fetch(`${API_BASE}/telegram/send`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: replyContact.chat_id, message: typedText }),
+            });
+            const data = await res.json();
+            if (data.success) {
+                setSendStatus({ type: "success", message: `Sent to ${replyContact.name}! 🚀` });
+                onTypedTextChange("");
+                setTimeout(() => navigate(`/chats/${replyContact.id}`), 1000);
+            } else {
+                setSendStatus({ type: "error", message: data.error || "Failed to send message" });
+                setIsSending(false);
+                setTimeout(() => setSendStatus(null), 4000);
+            }
+        } catch (e) {
+            setSendStatus({ type: "error", message: "Network error" });
+            setIsSending(false);
+            setTimeout(() => setSendStatus(null), 4000);
+        }
+    };
+
+    // Handle word selection from prediction panel
+    const handleSelectWord = useCallback((word: string) => {
+        // Replace the last partial word with the selected word + space
+        const text = typedText;
+        if (text.endsWith(" ") || text === "") {
+            // No partial word, just append
+            onTypedTextChange(text + word + " ");
+        } else {
+            // Replace the last partial word
+            const lastSpaceIdx = text.lastIndexOf(" ");
+            const prefix = lastSpaceIdx >= 0 ? text.substring(0, lastSpaceIdx + 1) : "";
+            onTypedTextChange(prefix + word + " ");
+        }
+        // Switch back to typing mode
+        onModeSwitch();
+    }, [typedText, onTypedTextChange, onModeSwitch]);
+
+    // Handle cancel from prediction panel
+    const handlePredictionCancel = useCallback(() => {
+        onModeSwitch();
+    }, [onModeSwitch]);
 
     const handleLeft = () => {
         if (currentNode.left) {
@@ -140,6 +217,8 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
     // Keyboard handler
     useEffect(() => {
         if (mode !== "typing") return;
+        // Don't capture keys when Telegram modals are open
+        if (telegramPickerOpen || addContactOpen) return;
 
         const handleKeyDown = (e: KeyboardEvent) => {
             if (["ArrowLeft", "ArrowRight"].includes(e.key)) {
@@ -197,7 +276,7 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
 
         window.addEventListener("keydown", handleKeyDown);
         return () => window.removeEventListener("keydown", handleKeyDown);
-    }, [mode, currentNode, typedText, confirmAction, confirmSelection]);
+    }, [mode, currentNode, typedText, confirmAction, confirmSelection, telegramPickerOpen, addContactOpen]);
 
     const TreeNodeDisplay = ({ node, depth = 0 }: { node?: TreeNode; depth?: number }) => {
         if (!node) return null;
@@ -239,6 +318,52 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
 
     return (
         <div className="h-full flex flex-col p-3 overflow-hidden relative">
+            {/* Send Status Toast */}
+            {sendStatus && (
+                <div className={cn(
+                    "absolute top-4 left-1/2 -translate-x-1/2 z-[70] px-5 py-3 rounded-xl shadow-2xl border-2 animate-in slide-in-from-top-4 duration-300 flex items-center gap-2",
+                    sendStatus.type === "success"
+                        ? "bg-green-500/20 border-green-500/50 text-green-400"
+                        : "bg-red-500/20 border-red-500/50 text-red-400"
+                )}>
+                    <span className="text-lg">{sendStatus.type === "success" ? "✅" : "❌"}</span>
+                    <span className="text-sm font-medium">{sendStatus.message}</span>
+                </div>
+            )}
+
+            {/* Telegram Contact Picker */}
+            <TelegramContactPicker
+                open={telegramPickerOpen}
+                message={typedText}
+                onClose={() => setTelegramPickerOpen(false)}
+                onSent={(contactName) => {
+                    setTelegramPickerOpen(false);
+                    setSendStatus({ type: "success", message: `Sent to ${contactName}!` });
+                    setTimeout(() => setSendStatus(null), 3000);
+                }}
+                onError={(error) => {
+                    setTelegramPickerOpen(false);
+                    setSendStatus({ type: "error", message: error });
+                    setTimeout(() => setSendStatus(null), 4000);
+                }}
+                onAddContact={() => {
+                    setTelegramPickerOpen(false);
+                    setAddContactOpen(true);
+                }}
+            />
+
+            {/* Add Contact Modal */}
+            <TelegramAddContact
+                open={addContactOpen}
+                onClose={() => {
+                    setAddContactOpen(false);
+                    setTelegramPickerOpen(true); // Go back to picker
+                }}
+                onAdded={() => {
+                    setAddContactOpen(false);
+                    setTelegramPickerOpen(true); // Refresh picker
+                }}
+            />
             {/* Confirmation Dialog Overlay */}
             {confirmAction && (
                 <div className="absolute inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
@@ -295,25 +420,56 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
 
             {/* Header with Clear All button */}
             <div className="flex items-center justify-between mb-3 gap-2">
-                {typedText.length > 0 && (
-                    <button
-                        onClick={() => { setConfirmAction("clear_text"); setConfirmSelection("no"); }}
-                        className="text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-400/30 hover:border-red-400/60 transition-all"
-                    >
-                        🗑️ Clear All
-                    </button>
-                )}
+                <div className="flex gap-2">
+                    {typedText.length > 0 && (
+                        <button
+                            onClick={() => { setConfirmAction("clear_text"); setConfirmSelection("no"); }}
+                            className="text-xs text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-400/30 hover:border-red-400/60 transition-all"
+                        >
+                            🗑️ Clear All
+                        </button>
+                    )}
+                    {typedText.length > 0 && (
+                        <button
+                            onClick={() => {
+                                if (replyContact) {
+                                    handleDirectReply();
+                                } else {
+                                    setTelegramPickerOpen(true);
+                                }
+                            }}
+                            disabled={isSending}
+                            className="text-xs text-blue-400 hover:text-blue-300 px-2 py-1 rounded border border-blue-400/30 hover:border-blue-400/60 transition-all flex items-center gap-1 disabled:opacity-50"
+                        >
+                            {replyContact ? `📨 Reply to ${replyContact.name}` : "📨 Send via Telegram"}
+                        </button>
+                    )}
+                </div>
             </div>
 
             {/* Text Display */}
-            <Card className="p-3 bg-card/60 border-2 border-accent/30 mb-3">
+            <Card className="p-3 bg-card/60 border-2 border-accent/30 mb-2">
                 <div className="min-h-[50px] text-lg font-mono">
                     {typedText}
                     <span className="inline-block w-1 h-5 bg-accent animate-pulse ml-1" />
                 </div>
             </Card>
 
-            <div className="flex-1 flex gap-3 overflow-hidden min-h-0">
+            {/* Inline Prediction Strip — always visible when text exists */}
+            <div className="mb-2">
+                <PredictionPanel
+                    typedText={typedText}
+                    active={mode === "prediction"}
+                    onSelectWord={handleSelectWord}
+                    onCancel={handlePredictionCancel}
+                />
+            </div>
+
+            {/* Tree + Right Panel — dims in prediction mode */}
+            <main className={cn(
+                "flex-1 flex gap-3 overflow-hidden min-h-0 transition-opacity duration-300",
+                mode === "prediction" ? "opacity-40 pointer-events-none" : "opacity-100"
+            )}>
                 <Card className="flex-[3] p-3 bg-card/60 border-border flex flex-col overflow-hidden">
                     <h3 className="text-base font-semibold text-center mb-2 text-primary">Morse Tree Navigation</h3>
                     <div className="flex-1 flex items-center justify-center min-h-0 overflow-hidden">
@@ -323,7 +479,6 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
                     </div>
                 </Card>
 
-                {/* Right side: Current node + Next choices + Controls */}
                 <div className="flex-[1] flex flex-col gap-2 overflow-hidden min-h-0">
                     {/* Current position */}
                     <Card className="p-3 bg-accent/10 border-2 border-accent">
@@ -365,10 +520,11 @@ export const MorseTree = ({ mode, typedText, onTypedTextChange }: MorseTreeProps
                             <div>👀 ← → Navigate tree</div>
                             <div>😉😉 Double blink = Select</div>
                             <div>😉😉😉 Triple blink = Back/Delete</div>
+                            <div>🧠 Focus = Switch Mode</div>
                         </div>
                     </Card>
                 </div>
-            </div>
+            </main>
         </div>
     );
 };

@@ -2,13 +2,14 @@ import { useEffect, useRef } from "react";
 import { useSignalStore } from "@/services/signalService";
 
 /**
- * Converts backend EOG command events into synthetic keyboard events.
+ * Converts backend EOG/EEG command events into synthetic keyboard events.
  * 
  * Mapping:
  *   LEFT      → ArrowLeft
  *   RIGHT     → ArrowRight  
  *   ENTER     → Enter
  *   BACKSPACE → Backspace
+ *   FOCUS     → Tab (toggles typing/prediction mode)
  * 
  * Includes a 700ms cooldown between injected keys to prevent
  * the UI from being overwhelmed by rapid signal events.
@@ -38,7 +39,8 @@ export const useKeyboardInjector = (enabled: boolean) => {
             "LEFT": "ArrowLeft",
             "RIGHT": "ArrowRight",
             "ENTER": "Enter",
-            "BACKSPACE": "Backspace"
+            "BACKSPACE": "Backspace",
+            "FOCUS": "Tab"
         };
 
         const key = keyMap[action];

@@ -10,6 +10,8 @@ export interface SignalData {
         count?: number;    // Blink count
     };
     focus: number;  // 0.0 to 1.0
+    envelope?: number;       // Blink envelope value
+    horizontal_dev?: number; // Horizontal deviation from baseline
 }
 
 // Command event from backend EOG processing
@@ -32,11 +34,19 @@ interface SignalState {
         device: string | null;
     };
     signalBatch: SignalData[]; // Array of signals
+    // Real-time sensitivity values (from signal_data)
+    envelope: number;
+    horizontalDev: number;
+    // User-adjustable thresholds
+    blinkThreshold: number;
+    eyeThreshold: number;
     // Actions
     connect: (url: string) => void;
     disconnect: () => void;
     scanDevices: () => Promise<any[]>;
     connectDevice: (protocol: string, address?: string) => Promise<boolean>;
+    setThresholds: (blink?: number, eye?: number) => Promise<void>;
+    fetchThresholds: () => Promise<void>;
 }
 
 export const useSignalStore = create<SignalState>((set, get) => ({
@@ -51,6 +61,10 @@ export const useSignalStore = create<SignalState>((set, get) => ({
         recording: false,
         device: null
     },
+    envelope: 0,
+    horizontalDev: 0,
+    blinkThreshold: 200,
+    eyeThreshold: 250,
 
     connect: (url: string) => {
         if (get().socket) return;
@@ -63,6 +77,8 @@ export const useSignalStore = create<SignalState>((set, get) => ({
         socket.on('connect', () => {
             console.log('Signal Service Connected');
             set({ isConnected: true });
+            // Fetch current thresholds from backend on connect
+            get().fetchThresholds();
         });
 
         socket.on('disconnect', () => {
@@ -90,7 +106,12 @@ export const useSignalStore = create<SignalState>((set, get) => ({
         });
 
         socket.on('signal_data', (data: any) => {
-            set({ lastSignal: data });
+            set({
+                lastSignal: data,
+                // Extract envelope and deviation for real-time bars
+                envelope: data.envelope ?? 0,
+                horizontalDev: data.horizontal_dev ?? 0,
+            });
         });
 
         set({ socket });
@@ -133,6 +154,42 @@ export const useSignalStore = create<SignalState>((set, get) => ({
         } catch (error) {
             console.error('Connection failed:', error);
             return false;
+        }
+    },
+
+    setThresholds: async (blink?: number, eye?: number) => {
+        try {
+            const body: any = {};
+            if (blink !== undefined) body.blink_threshold = blink;
+            if (eye !== undefined) body.eye_threshold = eye;
+
+            const response = await fetch('http://localhost:5000/set-thresholds', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await response.json();
+            if (data.status === 'ok') {
+                set({
+                    blinkThreshold: data.blink_threshold,
+                    eyeThreshold: data.eye_threshold
+                });
+            }
+        } catch (error) {
+            console.error('Failed to set thresholds:', error);
+        }
+    },
+
+    fetchThresholds: async () => {
+        try {
+            const response = await fetch('http://localhost:5000/get-thresholds');
+            const data = await response.json();
+            set({
+                blinkThreshold: data.blink_threshold ?? 200,
+                eyeThreshold: data.eye_threshold ?? 250
+            });
+        } catch (error) {
+            console.error('Failed to fetch thresholds:', error);
         }
     }
 }));

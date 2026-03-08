@@ -1,6 +1,6 @@
 import { Link } from "react-router-dom";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Keyboard, Home, AlertTriangle, Activity, Play } from "lucide-react";
+import { Keyboard, Home, AlertTriangle, Activity, Play, MessageSquare } from "lucide-react";
 import { SignalMonitor } from "@/components/SignalMonitor";
 import { ConnectionPanel } from "@/components/ConnectionPanel";
 
@@ -30,7 +30,21 @@ const Index = () => {
                             </CardHeader>
                             <CardContent>
                                 <p className="text-muted-foreground">
-                                    Type messages using blink codes or eye movements.
+                                    Type messages locally using blink codes or eye movements.
+                                </p>
+                            </CardContent>
+                        </Card>
+                    </Link>
+
+                    <Link to="/chats" className="block h-full">
+                        <Card className="h-full border-blue-200 hover:border-blue-500/50 hover:bg-blue-500/5 transition-all cursor-pointer group">
+                            <CardHeader>
+                                <MessageSquare className="w-12 h-12 text-blue-500 mb-2 group-hover:scale-110 transition-transform" />
+                                <CardTitle className="text-blue-500">Telegram Messages</CardTitle>
+                            </CardHeader>
+                            <CardContent>
+                                <p className="text-muted-foreground">
+                                    Read and reply to your Telegram chats.
                                 </p>
                             </CardContent>
                         </Card>

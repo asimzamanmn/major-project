@@ -5,11 +5,22 @@ import threading
 import time
 import numpy as np
 import logging
+import os
+
+# Load .env file if present (for TELEGRAM_BOT_TOKEN etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
+except ImportError:
+    pass  # python-dotenv not installed; rely on system env vars
 
 # Import our custom modules
 from connection.manager import Connection
 from signal_processing.eog import EOGProcessor
 from signal_processing.eeg import EEGProcessor
+from prediction import get_predictions
+from telegram_service import send_telegram_message, start_polling
+import db
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -88,6 +99,11 @@ def data_stream_loop():
                     focus_level = 0
                     if len(eeg_buffer) == EEG_WINDOW_SIZE and (len(eeg_buffer) % 50 == 0):
                         focus_level = eeg_processor.calculate_focus_level(np.array(eeg_buffer))
+                        
+                        # Check for focus state transitions → emit as command event
+                        focus_event = eeg_processor.update_focus_state(focus_level)
+                        if focus_event:
+                            socketio.emit('command', focus_event)
     
                     # Keep only the LATEST payload (don't batch all 500 samples)
                     latest_payload = {
@@ -188,6 +204,90 @@ def enable_keyboard():
 def get_keyboard_status():
     return jsonify({"enabled": False})
 
+@app.route('/set-thresholds', methods=['POST'])
+def set_thresholds():
+    data = request.json
+    blink_threshold = data.get('blink_threshold')
+    eye_threshold = data.get('eye_threshold')
+    eog_processor.set_thresholds(blink_threshold=blink_threshold, eye_threshold=eye_threshold)
+    return jsonify({
+        "status": "ok",
+        "blink_threshold": eog_processor.BLINK_THRESHOLD,
+        "eye_threshold": eog_processor.EYE_MOVEMENT_THRESHOLD
+    })
+
+@app.route('/get-thresholds', methods=['GET'])
+def get_thresholds():
+    return jsonify({
+        "blink_threshold": eog_processor.BLINK_THRESHOLD,
+        "eye_threshold": eog_processor.EYE_MOVEMENT_THRESHOLD
+    })
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    data = request.json
+    text = data.get('text', '')
+    predictions = get_predictions(text)
+    return jsonify({"predictions": predictions})
+
+# ── Telegram Endpoints ──────────────────────────────────────────────
+
+@app.route('/telegram/send', methods=['POST'])
+def telegram_send():
+    """Send a message to a Telegram contact."""
+    data = request.json
+    chat_id = data.get('chat_id', '')
+    message = data.get('message', '')
+    if not message.strip():
+        return jsonify({"success": False, "error": "Empty message"}), 400
+    if not chat_id.strip():
+        return jsonify({"success": False, "error": "No chat_id provided"}), 400
+    result = send_telegram_message(chat_id, message)
+    if result.get("success"):
+        # Save outgoing message to database
+        contact = db.get_contact_by_chat_id(chat_id)
+        if contact:
+            db.add_message(contact["id"], "user", message)
+            
+    status_code = 200 if result.get("success") else 500
+    return jsonify(result), status_code
+
+@app.route('/telegram/chats', methods=['GET'])
+def telegram_chats_overview():
+    """Return overview of all chats (contacts + latest messages)."""
+    return jsonify({"chats": db.get_chats_overview()})
+
+@app.route('/telegram/messages/<contact_id>', methods=['GET'])
+def telegram_messages_list(contact_id):
+    """Return message history for a specific contact."""
+    messages = db.get_messages(contact_id)
+    return jsonify({"messages": messages})
+
+@app.route('/telegram/contacts', methods=['GET'])
+def telegram_contacts_list():
+    """Return all saved Telegram contacts."""
+    return jsonify({"contacts": db.get_contacts()})
+
+@app.route('/telegram/contacts', methods=['POST'])
+def telegram_contacts_add():
+    """Add a new Telegram contact."""
+    data = request.json
+    name = data.get('name', '').strip()
+    chat_id = data.get('chat_id', '').strip()
+    if not name or not chat_id:
+        return jsonify({"error": "name and chat_id are required"}), 400
+    result = db.add_contact(name, chat_id)
+    if "error" in result:
+        return jsonify(result), 409
+    return jsonify({"contact": result}), 201
+
+@app.route('/telegram/contacts/<contact_id>', methods=['DELETE'])
+def telegram_contacts_delete(contact_id):
+    """Delete a Telegram contact by ID."""
+    if db.delete_contact(contact_id):
+        return jsonify({"status": "deleted"})
+    return jsonify({"error": "Contact not found"}), 404
+
 @socketio.on('connect')
 def handle_connect():
     logger.info("Client connected to WebSocket")
@@ -199,6 +299,9 @@ def handle_connect():
 @socketio.on('disconnect')
 def handle_disconnect():
     logger.info("Client disconnected")
+
+# Start the polling loop when the Flask app initializes
+start_polling(lambda ev, data: socketio.emit(ev, data))
 
 if __name__ == '__main__':
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)

@@ -1,6 +1,10 @@
 import numpy as np
 from scipy.signal import iirnotch, butter, lfilter
 import math
+import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class EEGProcessor:
     def __init__(self, sampling_rate=500):
@@ -9,30 +13,28 @@ class EEGProcessor:
         self.b_notch, self.a_notch = iirnotch(50.0 / (sampling_rate / 2), 30.0)
         self.b_band, self.a_band = butter(4, [0.5 / (sampling_rate / 2), 48.0 / (sampling_rate / 2)], btype='band')
         
-    def apply_filters(self, eeg_point):
-        """Apply Notch and Bandpass filters to a single point (note: lfilter state is not maintained here efficiently for single points in this simple port, 
-        but matching original logic. For better streaming, we should use sosfilt or maintain state).
-        The original beetle.py used lfilter on single points which implies stateless filtering per call if not careful, 
-        but let's look at the original: lfilter(b, a, [point]). This is stateless and inefficient but we stick to the port.
-        Wait, lfilter(b, a, [point]) basically just multiplies by b[0] if no state is passed. 
-        Actually, for a proper port, we should probably buffer or use `lfilter_zi` if we want real filtering.
-        However, to strictly 'copy' logic as requested:
-        """
-        # Original: 
-        # filtered = lfilter(b_notch, a_notch, [eeg_point])
-        # filtered_point = lfilter(b_band, a_band, filtered)
-        # This effectively does almost nothing meaningful if history isn't kept. 
-        # BUT user said "selectively port functionalities". 
-        # I will implement a slightly better version that uses a buffer if I were writing from scratch,
-        # but here I will blindly copy the function signature but maybe just return the point if the original was broken,
-        # OR better: Assume the user passes a BUFFER of data to `calculate_focus_level` which is what matters.
+        # --- Focus State Detection (inspired by Brain Bubbles beta threshold) ---
+        # Hysteresis thresholds: enter FOCUSED at high, exit at low
+        self.FOCUS_HIGH_THRESHOLD = 0.45   # beta+gamma ratio to enter FOCUSED
+        self.FOCUS_LOW_THRESHOLD  = 0.30   # beta+gamma ratio to exit FOCUSED
+        self.FOCUS_HOLD_TIME_S    = 2.0    # minimum seconds before state can change again
         
-        # The `calculate_focus_level` takes `eeg_data` array. That is the key function.
+        # Moving average smoother for focus level
+        self.SMOOTH_WINDOW = 5
+        self._focus_buffer = []
+        
+        # State tracking
+        self._focus_state = "RELAXED"      # "FOCUSED" or "RELAXED"
+        self._last_state_change = 0.0      # timestamp of last transition
+        
+    def apply_filters(self, eeg_point):
+        """Apply Notch and Bandpass filters (stateless per-call, kept for API compat)."""
         pass
 
     def calculate_focus_level(self, eeg_data):
         """
         Calculate focus level from a buffer of EEG data.
+        Returns beta+gamma ratio (0.0 to 1.0).
         """
         if len(eeg_data) == 0:
             return 0.0
@@ -55,3 +57,50 @@ class EEGProcessor:
             
         power = (beta_power + gamma_power) / total_power
         return power
+
+    def update_focus_state(self, focus_level):
+        """
+        Track smoothed focus level and detect state transitions.
+        Returns a command event dict on transitions, or None if no change.
+        
+        Uses hysteresis to prevent rapid flickering:
+          - Enter FOCUSED when smoothed level >= FOCUS_HIGH_THRESHOLD
+          - Exit  FOCUSED when smoothed level <= FOCUS_LOW_THRESHOLD
+          - Must hold state for FOCUS_HOLD_TIME_S before changing again
+        """
+        # Update moving average
+        self._focus_buffer.append(focus_level)
+        if len(self._focus_buffer) > self.SMOOTH_WINDOW:
+            self._focus_buffer.pop(0)
+        
+        smoothed = sum(self._focus_buffer) / len(self._focus_buffer)
+        
+        now = time.time()
+        time_since_change = now - self._last_state_change
+        
+        # Don't allow state change until hold time has passed
+        if time_since_change < self.FOCUS_HOLD_TIME_S:
+            return None
+        
+        new_state = self._focus_state
+        
+        if self._focus_state == "RELAXED" and smoothed >= self.FOCUS_HIGH_THRESHOLD:
+            new_state = "FOCUSED"
+        elif self._focus_state == "FOCUSED" and smoothed <= self.FOCUS_LOW_THRESHOLD:
+            new_state = "RELAXED"
+        
+        if new_state != self._focus_state:
+            old_state = self._focus_state
+            self._focus_state = new_state
+            self._last_state_change = now
+            logger.info(f"[FOCUS] State change: {old_state} → {new_state} (smoothed={smoothed:.3f})")
+            
+            # Emit as a command event — mapped to keyboard key on frontend
+            return {
+                "type": "focus",
+                "action": "FOCUS",
+                "state": new_state,
+                "focus_level": round(smoothed, 3)
+            }
+        
+        return None

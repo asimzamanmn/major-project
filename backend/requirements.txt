@@ -6,8 +6,11 @@ bleak
 numpy
 scipy
 pyserial
+wordfreq
 websocket-client
 eventlet
+requests
+python-dotenv
 
 # Optional GUI dependencies
 pyqtgraph

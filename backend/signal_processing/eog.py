@@ -84,6 +84,7 @@ class EnvelopeDetector:
         return envelope
 
 class BaselineTracker:
+    """Baseline tracker for horizontal EOG — ALWAYS updates (like CHORDS reference)"""
     def __init__(self, window_size=512):
         self.window_size = window_size
         self.buffer = np.zeros(window_size)
@@ -115,12 +116,12 @@ class EOGProcessor:
         self.adc_max = (2 ** self.adc_resolution) - 1
         self.adc_mid = self.adc_max / 2.0
         
-        # Blink Detection - EXACT from morsefixed.py
+        # --- Blink Detection (from CHORDS reference) ---
         self.BLINK_DEBOUNCE_MS = 200
         self.DOUBLE_BLINK_MS = 1000
         self.TRIPLE_BLINK_MS = 1500
-        self.BLINK_THRESHOLD = 200.0
-        self.BLINK_RELEASE_THRESHOLD = self.BLINK_THRESHOLD / 2  # 100.0
+        self.BLINK_THRESHOLD = 200.0       # Adjustable from frontend slider
+        self.BLINK_RELEASE_THRESHOLD = self.BLINK_THRESHOLD / 2
         
         self.last_blink_time = 0
         self.first_blink_time = 0
@@ -129,18 +130,21 @@ class EOGProcessor:
         self.blink_active = False
         self.blink_released = True
         
-        # Eye Movement Detection - FROM morsefixed.py (with calibration + locking)
+        # --- Eye Movement Detection (CHORDS approach: user adjusts threshold) ---
         self.EYE_MOVEMENT_DEBOUNCE_MS = 750
-        self.EYE_MOVEMENT_THRESHOLD = 150.0  # Will be auto-adjusted after calibration
-        self.EYE_MOVEMENT_RELEASE_THRESHOLD = 100.0
+        self.EYE_MOVEMENT_THRESHOLD = 250.0   # Adjustable from frontend slider
+        self.EYE_MOVEMENT_RELEASE_THRESHOLD = 20.0  # Like CHORDS reference
         self.last_eye_movement_time = 0
         self.eye_movement_active = False
         self.eye_movement_released = True
         self.last_direction = None
         self.previous_deviation = 0.0
-        self.baseline_calibration_complete = False
-        self.baseline_calibration_time = 0
-        self.dynamic_threshold_set = False
+        
+        # Return-to-center overshoot suppression
+        # After a movement is released, block opposite-direction detection for this duration
+        self.OVERSHOOT_SUPPRESSION_MS = 500
+        self._last_released_direction = None   # Direction that was just released
+        self._release_time_ms = 0              # When it was released
         
         # Filters
         self.eog_filter_vertical = EOGFilter()
@@ -150,24 +154,31 @@ class EOGProcessor:
         self.notch_filter_horizontal = NotchFilter()
         self.lowpass_filter_horizontal = LowPassFilter()
         
-        # Envelope detector (100ms window)
+        # Envelope detector (100ms window) — same as CHORDS
         envelope_window_ms = 100
         envelope_window_size = (envelope_window_ms * self.sampling_rate) // 1000
         self.envelope_detector = EnvelopeDetector(envelope_window_size)
         
-        # Baseline tracker - larger window from morsefixed.py
-        self.horizontal_baseline = BaselineTracker(window_size=2048)
-        self.calibration_buffer = []
-        self.baseline_locked = False
+        # Baseline tracker — ALWAYS updating, same as CHORDS (window=512)
+        self.horizontal_baseline = BaselineTracker(window_size=512)
         
         self.current_envelope = 0.0
         self.horizontal_signal = 0.0
         self._last_log_ms = 0
-        self._smoothed_deviation = 0.0  # For stable deviation_increasing check
         self._blink_suppression_ms = 0  # Suppress eye detection after blinks
 
+    def set_thresholds(self, blink_threshold=None, eye_threshold=None):
+        """Called from frontend slider to adjust sensitivity per user."""
+        if blink_threshold is not None:
+            self.BLINK_THRESHOLD = float(blink_threshold)
+            self.BLINK_RELEASE_THRESHOLD = self.BLINK_THRESHOLD / 2
+            print(f"[EOG] Blink threshold updated: {self.BLINK_THRESHOLD}")
+        if eye_threshold is not None:
+            self.EYE_MOVEMENT_THRESHOLD = float(eye_threshold)
+            print(f"[EOG] Eye movement threshold updated: {self.EYE_MOVEMENT_THRESHOLD}")
+
     def process_sample(self, raw_vertical, raw_horizontal):
-        """Process a single sample - EXACT from morsefixed.py"""
+        """Process a single sample through filters and detect events."""
         # Center raw values
         raw_vertical = raw_vertical - self.adc_mid
         raw_horizontal = raw_horizontal - self.adc_mid
@@ -184,10 +195,8 @@ class EOGProcessor:
         filt_horizontal = self.lowpass_filter_horizontal.process(filt_horizontal)
         self.horizontal_signal = filt_horizontal
         
-        # FROM morsefixed.py: Only update baseline during calibration, then LOCK it
-        if not self.baseline_calibration_complete:
-            self.horizontal_baseline.update(filt_horizontal)
-        # After calibration, DO NOT update baseline - prevents drift during eye movements
+        # ALWAYS update baseline — like CHORDS reference (never lock it)
+        self.horizontal_baseline.update(filt_horizontal)
         
         now_ms = int(time.time() * 1000)
         
@@ -195,7 +204,7 @@ class EOGProcessor:
         if now_ms - self._last_log_ms > 500:
             baseline = self.horizontal_baseline.get_baseline()
             deviation = self.horizontal_signal - baseline
-            print(f"[EOG] Env={self.current_envelope:.1f} BlinkCnt={self.blink_count} Cal={'Y' if self.baseline_calibration_complete else 'N'} | HSignal={self.horizontal_signal:.1f} Baseline={baseline:.1f} Dev={deviation:.1f} EyeThresh={self.EYE_MOVEMENT_THRESHOLD:.1f}")
+            print(f"[EOG] Env={self.current_envelope:.1f} | Dev={deviation:.1f} BlinkTh={self.BLINK_THRESHOLD:.0f} EyeTh={self.EYE_MOVEMENT_THRESHOLD:.0f}")
             self._last_log_ms = now_ms
         
         events = {}
@@ -211,7 +220,7 @@ class EOGProcessor:
         return events if events else None
 
     def detect_blinks(self, now_ms):
-        """EXACT from morsefixed.py"""
+        """Blink detection — same as CHORDS reference."""
         envelope_high = self.current_envelope > self.BLINK_THRESHOLD
         envelope_low = self.current_envelope < self.BLINK_RELEASE_THRESHOLD
         
@@ -257,50 +266,18 @@ class EOGProcessor:
         return None
 
     def detect_eye_movement(self, now_ms):
-        """From morsefixed.py - with blink artifact suppression"""
+        """Eye movement detection — CHORDS approach + overshoot suppression."""
         
-        # CRITICAL: Skip eye movement detection during and shortly after blinks
-        # Blinks create massive artifacts on the horizontal channel
+        # Suppress eye detection during and shortly after blinks (blink artifacts)
         if self.current_envelope > self.BLINK_RELEASE_THRESHOLD:
             self._blink_suppression_ms = now_ms
             return None
-        # Wait 300ms after blink ends before detecting eye movements
         if (now_ms - self._blink_suppression_ms) < 300:
             return None
         
         baseline = self.horizontal_baseline.get_baseline()
         deviation = self.horizontal_signal - baseline
         abs_deviation = abs(deviation)
-        
-        # Wait for baseline to stabilize (at least 2 seconds of data)
-        if not self.baseline_calibration_complete:
-            if self.baseline_calibration_time == 0:
-                self.baseline_calibration_time = now_ms
-                self.calibration_buffer = []
-            
-            self.calibration_buffer.append(self.horizontal_signal)
-            
-            if (now_ms - self.baseline_calibration_time) < 2000:
-                return None
-            else:
-                self.baseline_calibration_complete = True
-                median_baseline = np.median(np.array(self.calibration_buffer))
-                min_signal = np.min(self.calibration_buffer)
-                max_signal = np.max(self.calibration_buffer)
-                
-                left_range = abs(min_signal - median_baseline)
-                right_range = abs(max_signal - median_baseline)
-                dynamic_threshold = min(left_range, right_range) * 0.45
-                
-                self.EYE_MOVEMENT_THRESHOLD = max(100, min(200, dynamic_threshold))
-                self.dynamic_threshold_set = True
-                self.baseline_locked = True
-                
-                print(f"\n[CALIBRATION COMPLETE]")
-                print(f"  Baseline: {median_baseline:.1f}")
-                print(f"  Signal range: {min_signal:.1f} to {max_signal:.1f}")
-                print(f"  Auto threshold: {self.EYE_MOVEMENT_THRESHOLD:.1f}")
-                self.calibration_buffer = []
         
         # Determine current direction
         if deviation < -self.EYE_MOVEMENT_THRESHOLD:
@@ -310,33 +287,47 @@ class EOGProcessor:
         else:
             current_direction = None
         
-        # Dynamic release threshold (50% of movement threshold)
-        release_threshold = self.EYE_MOVEMENT_THRESHOLD * 0.5
-        
-        # Track release state
-        if abs_deviation < release_threshold and self.eye_movement_active:
+        # Track release state — must return to low deviation before next movement
+        if abs_deviation < self.EYE_MOVEMENT_RELEASE_THRESHOLD and self.eye_movement_active:
+            self._last_released_direction = self.last_direction  # Remember what was released
+            self._release_time_ms = now_ms
             self.eye_movement_released = True
             self.eye_movement_active = False
             self.last_direction = None
         
-        # Smooth the deviation for stable deviation_increasing comparison
-        # Use exponential moving average (alpha=0.1) instead of raw per-sample value
-        alpha = 0.1
-        self._smoothed_deviation = alpha * deviation + (1 - alpha) * self._smoothed_deviation
-        
-        # Check if deviation is increasing using smoothed values (10-unit hysteresis)
+        # Check if deviation is increasing (moving away from baseline, not returning)
+        # This is the CHORDS approach from morse_decoder.py
         deviation_increasing = False
-        if current_direction == "LEFT" and deviation < self._smoothed_deviation - 10:
-            deviation_increasing = True
-        elif current_direction == "RIGHT" and deviation > self._smoothed_deviation + 10:
-            deviation_increasing = True
+        if current_direction == "LEFT" and deviation < self.previous_deviation:
+            deviation_increasing = True  # Moving more negative
+        elif current_direction == "RIGHT" and deviation > self.previous_deviation:
+            deviation_increasing = True  # Moving more positive
+        
+        self.previous_deviation = deviation
+        
+        # OVERSHOOT SUPPRESSION: After releasing a LEFT movement, block RIGHT for 500ms
+        # (and vice versa). This prevents the return-to-center overshoot from triggering
+        # a false opposite-direction detection.
+        opposite_suppressed = False
+        if self._last_released_direction and current_direction:
+            time_since_release = now_ms - self._release_time_ms
+            if time_since_release < self.OVERSHOOT_SUPPRESSION_MS:
+                # Block the OPPOSITE direction only
+                if self._last_released_direction == "LEFT" and current_direction == "RIGHT":
+                    opposite_suppressed = True
+                elif self._last_released_direction == "RIGHT" and current_direction == "LEFT":
+                    opposite_suppressed = True
+            else:
+                # Suppression window expired, clear it
+                self._last_released_direction = None
         
         # Detect new movement
-        if self.baseline_calibration_complete and not self.eye_movement_active and current_direction is not None and \
+        if not self.eye_movement_active and current_direction is not None and \
            self.eye_movement_released and \
            (now_ms - self.last_eye_movement_time) >= self.EYE_MOVEMENT_DEBOUNCE_MS and \
            (self.last_direction is None or current_direction != self.last_direction) and \
-           deviation_increasing:
+           deviation_increasing and \
+           not opposite_suppressed:
             
             self.eye_movement_active = True
             self.eye_movement_released = False
